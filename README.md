@@ -45,7 +45,29 @@ Authorization: Bearer <api-key>
 
 ## 免费模型限制
 
-代理仅放行免费模型（`big-pickle` 及所有以 `-free` 结尾的模型），以 `deepseek-v4-flash-free` 为例：
+代理的 `/v1/models` 按三层规则挑选免费模型，上游名单变化后最多 10 分钟自动生效（缓存 TTL）：
+
+1. **静态规则**：`big-pickle` 及所有以 `-free` 结尾的模型，不依赖任何网络；
+2. **目录规则**：`https://models.opencode.ai/api.json` 中 `opencode` 下 `cost.input` 与 `cost.output` 同为 `0` 的模型，覆盖「免费但名字不带 `-free`」的情况；
+3. **覆写通道**：环境变量 `EXTRA_MODELS` 强制纳入、`BLOCK_MODELS` 强制剔除（优先级最高）。
+
+目录抓取失败时自动降级为静态规则，不影响服务；上游抖动时沿用上一次成功结果，`/models` 不会因此报错。
+
+> **限免模型（匿名/隐形模型）**：OpenCode 会不定时开放尚未公开的匿名模型，例如 2026-09 的 `union-alpha`。这类模型在写进 models.dev 目录之前不会被自动识别（它既不带 `-free` 后缀，也不在目录里），用环境变量兜底即可 —— Vercel 项目在 **Settings → Environment Variables** 加一条后 Redeploy：
+>
+> ```
+> EXTRA_MODELS=union-alpha
+> ```
+>
+> 多个模型用英文逗号分隔。两条通道都只是对上游 `/zen/v1/models` 返回的列表做白名单放行/剔除，不会凭空补出上游没有的模型；`union-alpha` 本身已在上游列表中，只是名字不带 `-free` 才被漏掉。等它正式写进 models.dev（无论 `cost=0` 继续免费，还是转付费），判定会自动切回目录规则，这时 `EXTRA_MODELS` 就可以删掉。反过来，若某个模型限免结束后仍被静态规则放行，用 `BLOCK_MODELS` 立刻剔除。
+
+| 环境变量             | 默认值            | 说明                          |
+|------------------|----------------|-----------------------------|
+| `EXTRA_MODELS`   | 空              | 逗号分隔，强制纳入模型列表（限免模型兜底，模型需在上游列表中） |
+| `BLOCK_MODELS`   | 空              | 逗号分隔，强制剔除，优先级最高             |
+| `MODEL_CACHE_TTL_MS` | `600000`（10 分钟） | 模型列表与目录缓存有效期 |
+
+上游返回的模型信息以 `deepseek-v4-flash-free` 为例：
 
 ```json
 {

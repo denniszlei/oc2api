@@ -1,13 +1,25 @@
 const OC_VERSION = "1.18.31";
-const PROXY_VERSION = "v1.6.1";
+const PROXY_VERSION = "v1.7.0";
 const ZEN_BASE_URL = "https://opencode.ai";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
+// models.dev 目录(README 里引用的 models.opencode.ai/api.json), 用于识别 cost 为 0 的免费模型
+const CATALOG_URL = "https://models.opencode.ai/api.json";
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
+const CATALOG_TIMEOUT_MS = 10 * 1000;
+const CATALOG_RETRY_MS = 60 * 1000;
+const DEFAULT_MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 const IMAGE_FALLBACK_MODEL = "mimo-v2.5-free"; // DeepSeek 不支持图片,带图请求路由到该带图模型
 
+// EXTRA_MODELS: 逗号分隔, 强制纳入模型列表(限免模型兜底); BLOCK_MODELS: 逗号分隔, 强制剔除(优先级最高)
+const EXTRA_MODELS = parseModelIdList(process.env.EXTRA_MODELS);
+const BLOCK_MODELS = new Set(parseModelIdList(process.env.BLOCK_MODELS));
+const MODEL_CACHE_TTL_MS = resolveModelCacheTTL();
+
 const userSessions = new Map();
-let cachedModels = null;
+// 模型列表与目录都带 TTL, 否则上游新上线的限免模型要等实例重启才会出现
+let modelCache = { models: null, at: 0 };
+let catalogCache = { free: null, etag: null, at: 0, nextTry: 0 };
 
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
@@ -252,9 +264,21 @@ async function modelsResponse() {
 }
 
 async function getAvailableModels() {
-	if (cachedModels) return cachedModels;
-	cachedModels = await fetchZenModels();
-	return cachedModels;
+	const now = Date.now();
+	if (modelCache.models && now - modelCache.at < MODEL_CACHE_TTL_MS) return modelCache.models;
+
+	try {
+		const models = await fetchZenModels();
+		modelCache = { models, at: now };
+		return models;
+	} catch (error) {
+		// 上游抖动时退回上次成功结果, 不让 /models 直接报错
+		if (modelCache.models) {
+			debugLog("[MODEL LIST STALE]", { message: error?.message || String(error), count: modelCache.models.length });
+			return modelCache.models;
+		}
+		throw error;
+	}
 }
 
 async function fetchZenModels() {
@@ -263,26 +287,38 @@ async function fetchZenModels() {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(ZEN_MODELS_URL, {
-			method: "GET",
-			headers: {
-				"Accept": "application/json",
-				"Authorization": "Bearer public",
-				"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-			},
-			signal: controller.signal,
-		});
+		// 目录与模型列表并行拉取: 目录失败只降级为静态规则, 不影响模型列表本身
+		const [response, catalogFree] = await Promise.all([
+			fetch(ZEN_MODELS_URL, {
+				method: "GET",
+				headers: {
+					"Accept": "application/json",
+					"Authorization": "Bearer public",
+					"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+				},
+				signal: controller.signal,
+			}),
+			fetchCatalogFreeModels(),
+		]);
 		const raw = await response.text();
 		const parsed = safeJsonParse(raw);
 
 		if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`);
 		if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response");
 
-		const models = parsed.data.filter((item) => isAllowedModelId(item?.id));
+		const models = parsed.data.filter((item) => isAllowedModelId(item?.id, catalogFree));
 
 		if (!models.length) throw new Error("No allowed models returned from upstream");
 
-		debugLog("[MODEL LIST]", { status: response.status, ms: Date.now() - started, total: parsed.data.length, allowed: models.length });
+		debugLog("[MODEL LIST]", {
+			status: response.status,
+			ms: Date.now() - started,
+			total: parsed.data.length,
+			allowed: models.length,
+			catalogFree: catalogFree ? catalogFree.size : 0,
+			extra: EXTRA_MODELS.length,
+			blocked: BLOCK_MODELS.size,
+		});
 		return models;
 	} catch (error) {
 		if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout");
@@ -292,12 +328,92 @@ async function fetchZenModels() {
 	}
 }
 
-function isAllowedModelId(id) {
-	return typeof id === "string" && (id === "big-pickle" || id.endsWith("-free"));
+// 免费模型三级判定:
+//   1) 覆写通道: BLOCK_MODELS 强制剔除(优先级最高), EXTRA_MODELS 强制纳入;
+//   2) 静态规则: big-pickle 与 *-free 后缀, 不依赖网络;
+//   3) 目录规则: models.dev 里 opencode provider 下 cost 输入/输出均为 0。
+// 目录规则覆盖「免费但名字不带 -free」的情况(如历史上的 grok-code); 限时免费但尚未写入
+// models.dev 的隐身模型(如 union-alpha)用 EXTRA_MODELS 兜底, 写入目录后自动生效。
+function isAllowedModelId(id, catalogFree) {
+	if (typeof id !== "string" || !id) return false;
+	if (BLOCK_MODELS.has(id)) return false;
+	if (EXTRA_MODELS.includes(id)) return true;
+	if (id === "big-pickle" || id.endsWith("-free")) return true;
+	return Boolean(catalogFree?.has(id));
+}
+
+// 拉取 models.dev 目录, 只保留 opencode(zen) provider 下 cost 为 0 的模型 id。
+// 目录约 4.7MB, 靠 ETag 复用 + TTL 缓存, 单个实例通常只完整下载一次。
+async function fetchCatalogFreeModels() {
+	const now = Date.now();
+	if (catalogCache.free && now - catalogCache.at < MODEL_CACHE_TTL_MS) return catalogCache.free;
+	// 目录不可用时退避重试, 避免每次 /models 都要等一遍目录超时
+	if (now < catalogCache.nextTry) return catalogCache.free;
+
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort("timeout"), CATALOG_TIMEOUT_MS);
+
+	try {
+		const headers = {
+			"Accept": "application/json",
+			// 与 Go 侧保持一致, 免得 models.dev 将来按 UA 过滤时两端行为分叉
+			"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+		};
+		if (catalogCache.etag) headers["If-None-Match"] = catalogCache.etag;
+
+		const response = await fetch(CATALOG_URL, { headers, signal: controller.signal });
+		if (response.status === 304 && catalogCache.free) {
+			catalogCache.at = now;
+			catalogCache.nextTry = 0;
+			return catalogCache.free;
+		}
+		if (!response.ok) throw new Error(`Catalog returned HTTP ${response.status}`);
+
+		const free = collectFreeCatalogModels(safeJsonParse(await response.text())?.opencode?.models);
+		if (!free) throw new Error("Invalid catalog response");
+
+		catalogCache = { free, etag: response.headers.get("etag") || null, at: now, nextTry: 0 };
+		debugLog("[CATALOG]", { free: free.size, ms: Date.now() - now });
+		return free;
+	} catch (error) {
+		// 目录不可用时退回缓存(可能为空), 调用方降级为静态规则; 记录退避窗口, 60 秒内不再重试
+		catalogCache.nextTry = Date.now() + CATALOG_RETRY_MS;
+		debugLog("[CATALOG ERROR]", { message: error?.message || String(error), cached: catalogCache.free?.size || 0 });
+		return catalogCache.free;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function collectFreeCatalogModels(models) {
+	if (!models || typeof models !== "object" || Array.isArray(models)) return null;
+
+	const free = new Set();
+	for (const [id, meta] of Object.entries(models)) {
+		const cost = meta?.cost;
+		if (!cost || typeof cost !== "object") continue;
+		// 只认严格的数字 0: null / "" / "0" 都算「未知」而非免费, 避免把付费模型当成免费放行
+		if (cost.input === 0 && cost.output === 0) free.add(id);
+	}
+	return free;
+}
+
+function parseModelIdList(value) {
+	return String(value ?? "")
+		.split(",")
+		.map((item) => item.trim())
+		.filter(Boolean);
+}
+
+function resolveModelCacheTTL() {
+	// 与 Go 侧 strconv.Atoi 对齐: 空串/纯空格/非十进制整数都回退默认值
+	const raw = String(process.env.MODEL_CACHE_TTL_MS ?? "").trim();
+	if (!/^\d+$/.test(raw)) return DEFAULT_MODEL_CACHE_TTL_MS;
+	return Number(raw);
 }
 
 function cachedModelCount() {
-	return Array.isArray(cachedModels) ? cachedModels.length : 0;
+	return Array.isArray(modelCache.models) ? modelCache.models.length : 0;
 }
 
 const reasoningPlaceholder = " ";

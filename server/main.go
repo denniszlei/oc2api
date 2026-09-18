@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	ProxyVersion = "v1.6.1"
+	ProxyVersion = "v1.7.0"
 	// OCVersion 是 UA 中上报的 OpenCode CLI 版本。
 	// 2026-09-17 Zen 给免费层推理端点加了客户端校验(实测, 直连 https://opencode.ai/zen/v1/chat/completions):
 	//   1) UA 必须形如 opencode/<semver> 且版本 >= 1.17.0 —— 低于则 426 UpgradeRequired
@@ -41,6 +42,15 @@ const (
 	ImageFallbackModel = "mimo-v2.5-free" // DeepSeek 不支持图片,带图请求路由到该带图模型
 )
 
+// models.dev 目录(README 里引用的 models.opencode.ai/api.json), 用于识别 cost 输入/输出均为 0 的
+// 免费模型 —— 覆盖免费但名字不带 -free 后缀的情况; 目录不可用时自动降级为静态规则。
+const (
+	catalogURL           = "https://models.opencode.ai/api.json"
+	catalogHTTPTimeout   = 10 * time.Second
+	catalogRetryDelay    = time.Minute
+	defaultModelCacheTTL = 10 * time.Minute
+)
+
 type Config struct {
 	Port      int    `yaml:"port"`
 	APIKey    string `yaml:"api-key"`
@@ -52,8 +62,27 @@ var (
 	Cfg            *Config
 	UserSessions   = &sync.Map{}
 	CachedModels   []map[string]interface{}
+	CachedModelsAt time.Time
 	CachedModelsMu sync.RWMutex
 	zenHTTPClient  = newZenHTTPClient()
+
+	// CatalogFreeModels 缓存 models.dev 里 cost 为 0 的模型 id;
+	// CatalogNextTry 是目录不可用时的退避时间点(零值表示不处于退避窗口)。
+	CatalogFreeModels map[string]bool
+	CatalogETag       string
+	CatalogAt         time.Time
+	CatalogNextTry    time.Time
+	CatalogMu         sync.Mutex
+)
+
+// 模型筛选配置, 由 loadModelFilterEnv 从环境变量一次性读取: EXTRA_MODELS(逗号分隔, 强制纳入,
+// 用于限免模型兜底)、BLOCK_MODELS(逗号分隔, 强制剔除, 优先级最高)、MODEL_CACHE_TTL_MS
+// (缓存毫秒数, 默认 10 分钟)。
+var (
+	modelFilterOnce sync.Once
+	extraModels     map[string]bool
+	blockedModels   map[string]bool
+	modelCacheTTL   time.Duration
 )
 
 var CORSHeaders = map[string]string{
@@ -443,13 +472,16 @@ func fetchZenModels() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("Invalid model list response")
 	}
 
+	catalogFree := catalogFreeModels()
+	loadModelFilterEnv()
+
 	var models []map[string]interface{}
 	for _, item := range data {
 		m, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if id, ok := m["id"].(string); ok && isAllowedModelId(id) {
+		if id, ok := m["id"].(string); ok && isAllowedModelId(id, catalogFree, extraModels, blockedModels) {
 			models = append(models, m)
 		}
 	}
@@ -461,30 +493,193 @@ func fetchZenModels() ([]map[string]interface{}, error) {
 	return models, nil
 }
 
-func isAllowedModelId(id string) bool {
-	return id == "big-pickle" || strings.HasSuffix(id, "-free")
+// isAllowedModelId 判定模型是否免费可用, 依次看三层: 覆写通道(BLOCK_MODELS 强制剔除,
+// EXTRA_MODELS 强制纳入)、静态规则(big-pickle 与 *-free 后缀, 不依赖任何网络)、
+// 目录规则(models.dev 里 opencode provider 下 cost 输入/输出均为 0)。
+// 目录规则覆盖「免费但名字不带 -free」的情况(如历史上的 grok-code); 限时免费但尚未写入
+// models.dev 的隐身模型(如 union-alpha)用 EXTRA_MODELS 兜底, 写入目录后自动生效。
+func isAllowedModelId(id string, catalogFree, extra, blocked map[string]bool) bool {
+	if id == "" {
+		return false
+	}
+	if blocked[id] {
+		return false
+	}
+	if extra[id] {
+		return true
+	}
+	if id == "big-pickle" || strings.HasSuffix(id, "-free") {
+		return true
+	}
+	return catalogFree[id]
+}
+
+// loadModelFilterEnv 读取模型筛选相关环境变量(只读一次)。
+func loadModelFilterEnv() {
+	modelFilterOnce.Do(func() {
+		extraModels = splitModelIDs(os.Getenv("EXTRA_MODELS"))
+		blockedModels = splitModelIDs(os.Getenv("BLOCK_MODELS"))
+		modelCacheTTL = parseModelCacheTTL(os.Getenv("MODEL_CACHE_TTL_MS"))
+	})
+}
+
+// parseModelCacheTTL 解析缓存毫秒数: 空串、空格、非十进制整数(如 1e3 / 0x10)或负值都回退默认值,
+// 与 JS 侧的正则校验保持一致。
+func parseModelCacheTTL(raw string) time.Duration {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return defaultModelCacheTTL
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 0 {
+		return defaultModelCacheTTL
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func splitModelIDs(value string) map[string]bool {
+	ids := map[string]bool{}
+	for _, part := range strings.Split(value, ",") {
+		if id := strings.TrimSpace(part); id != "" {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+// catalogFreeModels 返回 models.dev 目录里 opencode(zen) provider 下 cost 输入/输出均为 0 的模型 id。
+// 目录约 4.7MB, 靠 ETag 复用 + TTL 缓存; 任一环节失败都退回上一次结果(可能为 nil),
+// 调用方随即降级为静态规则, 不会阻断 /models。
+func catalogFreeModels() map[string]bool {
+	loadModelFilterEnv()
+
+	CatalogMu.Lock()
+	defer CatalogMu.Unlock()
+
+	now := time.Now()
+	if CatalogFreeModels != nil && now.Sub(CatalogAt) < modelCacheTTL {
+		return CatalogFreeModels
+	}
+	// 目录不可用时退避重试, 避免每次 /models 都要等一遍目录超时
+	if now.Before(CatalogNextTry) {
+		return CatalogFreeModels
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), catalogHTTPTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", catalogURL, nil)
+	if err != nil {
+		return CatalogFreeModels
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", zenUserAgent())
+	if CatalogETag != "" {
+		req.Header.Set("If-None-Match", CatalogETag)
+	}
+
+	resp, err := zenHTTPClient.Do(req)
+	if err != nil {
+		CatalogNextTry = time.Now().Add(catalogRetryDelay)
+		debugLog("[CATALOG ERROR]", map[string]interface{}{"message": err.Error(), "cached": len(CatalogFreeModels)})
+		return CatalogFreeModels
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified && CatalogFreeModels != nil {
+		CatalogAt = now
+		CatalogNextTry = time.Time{}
+		return CatalogFreeModels
+	}
+	if resp.StatusCode != http.StatusOK {
+		CatalogNextTry = time.Now().Add(catalogRetryDelay)
+		debugLog("[CATALOG ERROR]", map[string]interface{}{"status": resp.StatusCode, "cached": len(CatalogFreeModels)})
+		return CatalogFreeModels
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		CatalogNextTry = time.Now().Add(catalogRetryDelay)
+		return CatalogFreeModels
+	}
+
+	free := extractCatalogFreeModels(string(raw))
+	if free == nil {
+		CatalogNextTry = time.Now().Add(catalogRetryDelay)
+		return CatalogFreeModels
+	}
+
+	CatalogFreeModels = free
+	CatalogETag = resp.Header.Get("ETag")
+	CatalogAt = now
+	CatalogNextTry = time.Time{}
+	debugLog("[CATALOG]", map[string]interface{}{"free": len(free)})
+	return CatalogFreeModels
+}
+
+func extractCatalogFreeModels(raw string) map[string]bool {
+	parsed := safeUnmarshal(raw)
+	if parsed == nil {
+		return nil
+	}
+	provider, ok := parsed["opencode"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	models, ok := provider["models"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	free := map[string]bool{}
+	for id, entry := range models {
+		meta, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cost, ok := meta["cost"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// getFloat 取不到时返回 -1, 缺字段不会被误判成免费
+		if getFloat(cost["input"], -1) == 0 && getFloat(cost["output"], -1) == 0 {
+			free[id] = true
+		}
+	}
+	// 注意: 空集合是「解析成功但没有免费模型」, 不能返回 nil —— 否则会被当成抓取失败,
+	// 触发退避并一直沿用过期的旧集合。
+	return free
 }
 
 func getAvailableModels() ([]map[string]interface{}, error) {
+	loadModelFilterEnv()
+
 	CachedModelsMu.RLock()
-	if CachedModels != nil {
-		defer CachedModelsMu.RUnlock()
-		return CachedModels, nil
-	}
+	cached, cachedAt := CachedModels, CachedModelsAt
 	CachedModelsMu.RUnlock()
+	// 带 TTL: 否则上游新上线的限免模型要等进程重启才会出现
+	if cached != nil && time.Since(cachedAt) < modelCacheTTL {
+		return cached, nil
+	}
 
 	CachedModelsMu.Lock()
 	defer CachedModelsMu.Unlock()
 
-	if CachedModels != nil {
+	if CachedModels != nil && time.Since(CachedModelsAt) < modelCacheTTL {
 		return CachedModels, nil
 	}
 
 	models, err := fetchZenModels()
 	if err != nil {
+		// 上游抖动时退回上次成功结果, 不让 /models 直接报错
+		if CachedModels != nil {
+			debugLog("[MODEL LIST STALE]", map[string]interface{}{"message": err.Error(), "count": len(CachedModels)})
+			return CachedModels, nil
+		}
 		return nil, err
 	}
 	CachedModels = models
+	CachedModelsAt = time.Now()
 	return models, nil
 }
 
